@@ -1,0 +1,249 @@
+#!/usr/bin/python
+
+from __future__ import print_function
+
+import apt
+import apt_pkg
+from argparse import ArgumentParser
+import errno
+import logging
+import os
+import shutil
+import sys
+
+apt_pkg.init()
+
+DEFAULT_URL = 'http://obs-master.endlessm-sf.com:82/shared/eos'
+DEFAULT_SUITE = 'master'
+DEFAULT_ARCH = 'i386'
+DEFAULT_PLATFORM = 'i386'
+DEFAULT_COMPONENTS = ['endless', 'extra', 'core']
+DEFAULT_KEYRING = '/usr/share/keyrings/eos-archive-keyring.gpg'
+
+def makedirs(*args, **kwargs):
+    try:
+        os.makedirs(*args, **kwargs)
+    except OSError as err:
+        if err.errno != errno.EEXIST:
+            raise
+
+# Apt cache filter returning only required and important packages.
+class RequiredFilter(apt.cache.Filter):
+    def apply(self, pkg):
+        if pkg.candidate is None:
+            # Assume any required packages actually have a candidate
+            # in our apt cache.
+            return False
+        priority = pkg.candidate.priority.lower()
+        if priority == 'required' or priority == 'important':
+            return True
+        else:
+            return False
+
+class AptBootstrap(object):
+    NEEDED_DIRS = ['etc/apt/apt.conf.d', 'etc/apt/preferences.d',
+                   'etc/apt/trusted.gpg.d', 'var/lib/apt/lists/partial',
+                   'var/cache/apt/archives/partial', 'var/log/apt',
+                   'var/lib/dpkg', 'var/lib/dpkg/updates',
+                   'var/lib/dpkg/info']
+
+    def __init__(self, path, suite=DEFAULT_SUITE, url=DEFAULT_URL,
+                 components=DEFAULT_COMPONENTS, arch=None,
+                 packages=[], keyring=None, recommends=True,
+                 debug=False):
+        self.path = os.path.abspath(path)
+        self.suite = suite
+        self.url = url
+        self.components = components
+        self.arch = arch
+        self.packages = packages
+        self.keyring = None
+        self.recommends = recommends
+        self.debug = None
+
+        # Use current arch if none specified
+        if self.arch is None:
+            self.arch = apt_pkg.get_architectures()[0]
+            logging.info('Using architecture %s' % self.arch)
+
+        # Use EOS keyring if it exists and none specified
+        if self.keyring is None and os.path.exists(DEFAULT_KEYRING):
+            self.keyring = DEFAULT_KEYRING
+            logging.info('Using keyring %s' % self.keyring)
+
+        # Create needed directories
+        for dir in self.NEEDED_DIRS:
+            makedirs(os.path.join(self.path, dir))
+
+        # Create sources.list
+        sources_list = os.path.join(self.path, 'etc/apt/sources.list')
+        if not os.path.exists(sources_list):
+            with open(sources_list, 'w') as f:
+                f.write('deb %s %s %s\n' %(self.url, self.suite,
+                                           ' '.join(self.components)))
+
+        # Create empty dpkg status so it looks like there are no
+        # packages installed
+        dpkg_status = os.path.join(self.path, 'var/lib/dpkg/status')
+        if not os.path.exists(dpkg_status):
+            with open(dpkg_status, 'w') as f:
+                pass
+
+        # Setup configuration
+        apt_pkg.config.set('APT::Architecture', self.arch)
+        apt_pkg.config.set('Dir', self.path)
+        apt_pkg.config.set('Dir::State::status', dpkg_status)
+        #apt_pkg.config.set('Dir::State::status', 'var/lib/dpkg/status')
+        apt_pkg.config.set('Dpkg::Options::',
+                           '--root=%s' % os.path.abspath(self.path))
+        apt_pkg.config.set('APT::Install-Recommends',
+                           str(self.recommends))
+        if self.keyring is not None:
+            #apt_pkg.config.set('Dir::Etc::trusted', self.keyring)
+            keyring_path = os.path.join(self.path, 'etc/apt/trusted.gpg.d',
+                                        os.path.basename(self.keyring))
+            if not os.path.exists(keyring_path):
+                shutil.copy(self.keyring, keyring_path)
+        else:
+            # If no keyring is provided, package verification will fail
+            apt_pkg.config.set('APT::Get::AllowUnauthenticated', 'true')
+        if self.debug:
+            apt_pkg.config.set('Debug::pkgDepCache::AutoInstall', 'true')
+            apt_pkg.config.set('Debug::pkgProblemResolver', 'true')
+            apt_pkg.config.set('Dpkg::Options::', '-D3')
+
+        self.cache = apt.Cache()
+        self.progress = apt.progress.text.AcquireProgress(outfile=sys.stderr)
+
+    def update(self):
+        self.cache.update(self.progress)
+        self.cache.open()
+
+    def mark_packages(self):
+        with self.cache.actiongroup():
+            # Required packages
+            print('Adding required packages', file=sys.stderr)
+            required = apt.cache.FilteredCache(self.cache)
+            required.set_filter(RequiredFilter())
+            for pkg in required:
+                # Mark required packages for install without deps like
+                # debootstrap
+                logging.debug('Adding required package %s' % pkg.name)
+                # if self.debug:
+                #     print('Adding required package', pkg.name,
+                #           file=sys.stderr)
+                #pkg.mark_install(auto_inst=False)
+                pkg.mark_install()
+
+            print('Adding requested packages', file=sys.stderr)
+            for name in self.packages:
+                pkg = self.cache[name]
+                logging.debug('Adding requested package %s' % pkg.name)
+                # if self.debug:
+                #     print('Adding requested package', name,
+                #           file=sys.stderr)
+                pkg.mark_install()
+
+    def get_packages(self):
+        packages = {}
+        for pkg in self.cache.get_changes():
+            # If this is a multi-arch package, use the fullname with the
+            # architecture to match output from dpkg-query.
+            multi_arch = pkg.candidate.record.get('Multi-Arch', '')
+            if multi_arch == 'same':
+                name = pkg.fullname
+            else:
+                name = pkg.shortname
+            version = pkg.candidate.version
+            packages[name] = version
+        return packages
+
+    def install_packages(self):
+        debconf_rc = os.path.join(self.path, 'tmp', 'debconf.conf')
+        debconf_config = os.path.join(self.path, 'tmp',
+                                      'debconf-config.dat')
+        debconf_templates = os.path.join(self.path, 'tmp',
+                                         'debconf-templates.dat')
+        makedirs(os.path.join(self.path, 'tmp'))
+        os.environ['DEBCONF_SYSTEMRC'] = debconf_rc
+        os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
+        os.environ['DPKG_ADMINDIR'] = os.path.join(self.path, 'var/lib/dpkg')
+        with open(debconf_rc, 'w') as rc:
+            rc.writelines(['Config: configdb\n',
+                           'Templates: templatedb\n',
+                           '\n',
+                           'Name: configdb\n',
+                           'Driver: File\n',
+                           'Filename: %s\n' % debconf_config,
+                           'Required: false\n',
+                           'Backup: false\n',
+                           '\n',
+                           'Name: templatedb\n',
+                           'Driver: File\n',
+                           'Filename: %s\n' % debconf_templates,
+                           'Required: false\n',
+                           'Backup: false\n'])
+        with open(debconf_config, 'w') as f:
+            os.fchmod(f.fileno(), 0o0600)
+        with open(debconf_templates, 'w') as f:
+            os.fchmod(f.fileno(), 0o0600)
+
+        self.cache.commit(fetch_progress=self.progress)
+
+        for f in [debconf_rc, debconf_config, debconf_templates]:
+            if os.path.exists(f):
+                os.unlink(f)
+
+if __name__ == '__main__':
+    aparser = ArgumentParser(description='Bootstrap system with APT')
+    aparser.add_argument('-n', '--dry-run', action='store_true',
+                         help='print packages and exit')
+    aparser.add_argument('-a', '--arch', help='target architecture')
+    aparser.add_argument('--components', default=DEFAULT_COMPONENTS,
+                         help='components from archive to use')
+    aparser.add_argument('--packages', default='',
+                         help='packages to include')
+    aparser.add_argument('--keyring', help='keyring for verification')
+    aparser.add_argument('--recommends', action='store_true',
+                         default=True, help='enable package recommends')
+    aparser.add_argument('--no-recommends', dest='recommends',
+                         action='store_false',
+                         help='disable package recommends')
+    aparser.add_argument('-v', '--verbose', action='store_true',
+                         help='enable verbose output')
+    aparser.add_argument('--debug', action='store_true',
+                         help='enable debugging output')
+    aparser.add_argument('SUITE', help='archive branch')
+    aparser.add_argument('TARGET', help='path to bootstrap')
+    aparser.add_argument('MIRROR', nargs='?', default=DEFAULT_URL,
+                         help='archive URL')
+    args = aparser.parse_args()
+
+    loglevel = logging.WARNING
+    if args.verbose:
+        loglevel = logging.INFO
+    if args.debug:
+        loglevel = logging.DEBUG
+    logging.basicConfig(format='%(module)s: %(levelname)s: %(message)s',
+                        level=loglevel)
+
+    packages = []
+    args.packages = args.packages.strip()
+    if len(args.packages) > 0:
+        packages = args.packages.split(',')
+
+    bootstrap = AptBootstrap(args.TARGET, args.SUITE, args.MIRROR,
+                             components=args.components,
+                             arch=args.arch,
+                             packages=packages,
+                             keyring=args.keyring,
+                             recommends=args.recommends,
+                             debug=args.debug)
+    bootstrap.update()
+    bootstrap.mark_packages()
+    if args.dry_run:
+        packages = bootstrap.get_packages()
+        for pkg, ver in sorted(packages.items()):
+            print(pkg, ver, sep='\t')
+    else:
+        bootstrap.install_packages()    
