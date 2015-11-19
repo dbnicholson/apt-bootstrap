@@ -3,12 +3,16 @@
 from __future__ import print_function
 
 import apt
+import apt_inst
 import apt_pkg
 from argparse import ArgumentParser
+import atexit
 import errno
 import logging
 import os
 import shutil
+import stat
+import subprocess
 import sys
 
 apt_pkg.init()
@@ -27,18 +31,17 @@ def makedirs(*args, **kwargs):
         if err.errno != errno.EEXIST:
             raise
 
-# Apt cache filter returning only required and important packages.
-class RequiredFilter(apt.cache.Filter):
+class PriorityFilter(apt.cache.Filter):
+    def __init__(self, priority):
+        super(PriorityFilter, self).__init__()
+        if priority not in ['essential', 'required', 'important']:
+            raise Exception('Unrecognized priority %s' % self.priority)
+        self.priority = priority
+
     def apply(self, pkg):
-        if pkg.candidate is None:
-            # Assume any required packages actually have a candidate
-            # in our apt cache.
-            return False
-        priority = pkg.candidate.priority.lower()
-        if priority == 'required' or priority == 'important':
-            return True
-        else:
-            return False
+        if self.priority == 'essential':
+            return pkg.essential
+        return pkg.candidate.priority.lower() == self.priority
 
 class AptBootstrap(object):
     NEEDED_DIRS = ['etc/apt/apt.conf.d', 'etc/apt/preferences.d',
@@ -49,17 +52,24 @@ class AptBootstrap(object):
 
     def __init__(self, path, suite=DEFAULT_SUITE, url=DEFAULT_URL,
                  components=DEFAULT_COMPONENTS, arch=None,
-                 packages=[], keyring=None, recommends=True,
-                 debug=False):
+                 packages=[], keyring=None, required=True,
+                 important=True, recommends=True, debug=False,
+                 dry_run=False):
         self.path = os.path.abspath(path)
         self.suite = suite
         self.url = url
         self.components = components
         self.arch = arch
         self.packages = packages
-        self.keyring = None
+        self.keyring = keyring
+        self.required = required
+        self.important = important
         self.recommends = recommends
-        self.debug = None
+        self.debug = debug
+        self.dry_run = dry_run
+
+        self.mounts = []
+        atexit.register(self.umount_all)
 
         # Use current arch if none specified
         if self.arch is None:
@@ -84,20 +94,19 @@ class AptBootstrap(object):
 
         # Create empty dpkg status so it looks like there are no
         # packages installed
-        dpkg_status = os.path.join(self.path, 'var/lib/dpkg/status')
-        if not os.path.exists(dpkg_status):
-            with open(dpkg_status, 'w') as f:
+        self.dpkg_status = os.path.join(self.path, 'var/lib/dpkg/status')
+        if not os.path.exists(self.dpkg_status):
+            with open(self.dpkg_status, 'w') as f:
                 pass
 
         # Setup configuration
         apt_pkg.config.set('APT::Architecture', self.arch)
         apt_pkg.config.set('Dir', self.path)
-        apt_pkg.config.set('Dir::State::status', dpkg_status)
-        #apt_pkg.config.set('Dir::State::status', 'var/lib/dpkg/status')
-        apt_pkg.config.set('Dpkg::Options::',
-                           '--root=%s' % os.path.abspath(self.path))
+        apt_pkg.config.set('DPkg::Chroot-Directory', self.path)
+        apt_pkg.config.set('Dir::State::status', self.dpkg_status)
         apt_pkg.config.set('APT::Install-Recommends',
                            str(self.recommends))
+        apt_pkg.config.set('Dpkg::Options::', '--force-unsafe-io')
         if self.keyring is not None:
             #apt_pkg.config.set('Dir::Etc::trusted', self.keyring)
             keyring_path = os.path.join(self.path, 'etc/apt/trusted.gpg.d',
@@ -110,38 +119,75 @@ class AptBootstrap(object):
         if self.debug:
             apt_pkg.config.set('Debug::pkgDepCache::AutoInstall', 'true')
             apt_pkg.config.set('Debug::pkgProblemResolver', 'true')
-            apt_pkg.config.set('Dpkg::Options::', '-D3')
+            apt_pkg.config.set('Debug::pkgInitConfig', 'true')
+            #apt_pkg.config.set('Debug::pkgDPkgPM', 'true')
 
         self.cache = apt.Cache()
+        self.archive_dir = apt_pkg.config.find_dir('Dir::Cache::archives')
         self.progress = apt.progress.text.AcquireProgress(outfile=sys.stderr)
+
+    def mount(self, *args):
+        target = args[-1]
+        if os.path.ismount(target):
+            logging.warning('%s is already mounted' % target)
+            return
+        logging.info('Mounting %s' % target)
+        makedirs(target)
+        subprocess.check_call(['mount'] + list(args))
+        self.mounts.append(target)
+
+    def umount(self, target):
+        for index, value in enumerate(self.mounts):
+            if value == target:
+                logging.info('Unmounting %s' % target)
+                subprocess.check_call(['umount', target])
+                del self.mounts[index]
+                return
+
+        # Not found
+        raise Exception('%s was not mounted from here' % target)
+
+    def umount_all(self):
+        while len(self.mounts) > 0:
+            target = self.mounts[-1]
+            logging.info('Unmounting %s' % target)
+            subprocess.check_call(['umount', target])
+            self.mounts.pop()
+
+    def __del__(self):
+        self.umount_all()
 
     def update(self):
         self.cache.update(self.progress)
         self.cache.open()
 
-    def mark_packages(self):
+    def mark_all_packages(self):
+        self.mark_priority_packages('essential')
+        if self.required:
+            self.mark_priority_packages('required')
+        if self.important:
+            self.mark_priority_packages('important')
+        self.mark_requested_packages()
+
+    def mark_priority_packages(self, priority):
         with self.cache.actiongroup():
-            # Required packages
-            print('Adding required packages', file=sys.stderr)
-            required = apt.cache.FilteredCache(self.cache)
-            required.set_filter(RequiredFilter())
-            for pkg in required:
-                # Mark required packages for install without deps like
-                # debootstrap
-                logging.debug('Adding required package %s' % pkg.name)
-                # if self.debug:
-                #     print('Adding required package', pkg.name,
-                #           file=sys.stderr)
-                #pkg.mark_install(auto_inst=False)
+            print('Adding', priority, 'packages', file=sys.stderr)
+            packages = apt.cache.FilteredCache(self.cache)
+            packages.set_filter(PriorityFilter(priority))
+            for pkg in packages:
+                logging.debug('Adding %s package %s' % (priority, pkg.name))
                 pkg.mark_install()
 
+            # HACK - we should make this a hard dependency of debconf
+            if priority == 'essential':
+                self.cache['apt-utils'].mark_install()
+
+    def mark_requested_packages(self):
+        with self.cache.actiongroup():
             print('Adding requested packages', file=sys.stderr)
             for name in self.packages:
                 pkg = self.cache[name]
                 logging.debug('Adding requested package %s' % pkg.name)
-                # if self.debug:
-                #     print('Adding requested package', name,
-                #           file=sys.stderr)
                 pkg.mark_install()
 
     def get_packages(self):
@@ -158,41 +204,243 @@ class AptBootstrap(object):
             packages[name] = version
         return packages
 
-    def install_packages(self):
-        debconf_rc = os.path.join(self.path, 'tmp', 'debconf.conf')
-        debconf_config = os.path.join(self.path, 'tmp',
-                                      'debconf-config.dat')
-        debconf_templates = os.path.join(self.path, 'tmp',
-                                         'debconf-templates.dat')
-        makedirs(os.path.join(self.path, 'tmp'))
-        os.environ['DEBCONF_SYSTEMRC'] = debconf_rc
-        os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
-        os.environ['DPKG_ADMINDIR'] = os.path.join(self.path, 'var/lib/dpkg')
-        with open(debconf_rc, 'w') as rc:
-            rc.writelines(['Config: configdb\n',
-                           'Templates: templatedb\n',
-                           '\n',
-                           'Name: configdb\n',
-                           'Driver: File\n',
-                           'Filename: %s\n' % debconf_config,
-                           'Required: false\n',
-                           'Backup: false\n',
-                           '\n',
-                           'Name: templatedb\n',
-                           'Driver: File\n',
-                           'Filename: %s\n' % debconf_templates,
-                           'Required: false\n',
-                           'Backup: false\n'])
-        with open(debconf_config, 'w') as f:
-            os.fchmod(f.fileno(), 0o0600)
-        with open(debconf_templates, 'w') as f:
-            os.fchmod(f.fileno(), 0o0600)
+    def extract_member(self, member, data):
+        if len(data) != member.size:
+            raise Exception('%s data length %d != size %d'
+                            %(member.name, len(data), member.size))
+        logging.debug('Extracting %s' % member.name)
+        dest = os.path.join(self.path, member.name)
+        makedirs(os.path.dirname(dest))
+        if member.isfile():
+            with open(dest, 'wb') as f:
+                f.write(data)
+        elif member.isdir():
+            makedirs(dest)
+        elif member.issym():
+            os.symlink(member.linkname, dest)
+        elif member.islnk():
+            os.link(os.path.join(self.path, member.linkname), dest)
+        elif member.isdev():
+            if member.ischr():
+                mode = member.mode | stat.S_IFCHR
+                device = os.makedev(member.major, member.minor)
+            elif member.isblk():
+                mode = member.mode | stat.S_IFBLK
+                device = os.makedev(member.major, member.minor)
+            elif member.isfifo():
+                mode = member.mode | stat.S_IFIFO
+                device = 0
+            else:
+                raise Exception('Unexpected device member %s' % member.name)
+            os.mknod(dest, mode=mode, device=device)
+        else:
+            raise Exception("Don't know how to handle %s" % member.name)
 
+        os.lchown(dest, member.uid, member.gid)
+        if not member.issym():
+            os.chmod(dest, member.mode)
+            os.utime(dest, (member.mtime, member.mtime))
+
+    def archive_path(self, pkg):
+        candidate = pkg.candidate
+        base = '%s_%s_%s.deb' %(pkg.name,
+                                apt_pkg.quote_string(candidate.version, ':'),
+                                candidate.architecture)
+        return os.path.join(self.archive_dir, base)
+
+    def fake_install(self, pkg):
+        name = pkg.name
+        version = pkg.candidate.version
+
+        logging.debug('Faking installation of %s' % name)
+        with open(self.dpkg_status, 'w+') as f:
+            f.writelines(['Package: %s\n' % name,
+                          'Version: %s\n' % version,
+                          'Maintainer: unknown\n',
+                          'Status: install ok installed\n\n'])
+
+        info = os.path.join(self.path, 'var/lib/dpkg/info',
+                            name + '.list')
+        with open(info, 'w+') as f:
+            pass
+
+    def dpkg_install(self, pkg, force=False):
+        archive = self.archive_path(pkg)
+        target_archive = os.path.join('/', os.path.relpath(archive,
+                                                           self.path))
+        cmd = ['chroot', self.path, 'dpkg', '--install',
+               '--force-depends', target_archive]
+        logging.debug('Using dpkg to install %s' % pkg.name)
+        subprocess.check_call(cmd)
+
+    def dpkg_unpack(self, pkg):
+        archive = self.archive_path(pkg)
+        target_archive = os.path.join('/', os.path.relpath(archive,
+                                                           self.path))
+        cmd = ['chroot', self.path, 'dpkg', '--unpack',
+               '--force-depends', target_archive]
+        logging.debug('Using dpkg to unpack %s' % pkg.name)
+        subprocess.check_call(cmd)
+
+    def dpkg_configure_pending(self):
+        cmd = ['chroot', self.path, 'dpkg', '--configure',
+               '--force-depends', '--pending', '--force-configure-any']
+        logging.debug('Using dpkg to configure packages')
+        subprocess.check_call(cmd)
+
+    def makedev(self):
+        """Create /dev files like debootstrap"""
+        # Device files
+        nodes = [('console', 0, 5, 0o600, stat.S_IFCHR, 5, 1),
+                 ('full', 0, 0, 0o666, stat.S_IFCHR, 1, 7),
+                 ('kmem', 0, 15, 0o640, stat.S_IFCHR, 1, 2),
+                 ('mem', 0, 15, 0o640, stat.S_IFCHR, 1, 1),
+                 ('null', 0, 0, 0o666, stat.S_IFCHR, 1, 3),
+                 ('port', 0, 15, 0o640, stat.S_IFCHR, 1, 4),
+                 ('ptmx', 0, 5, 0o666, stat.S_IFCHR, 5, 2),
+                 ('random', 0, 0, 0o666, stat.S_IFCHR, 1, 8),
+                 ('tty', 0, 5, 0o666, stat.S_IFCHR, 5, 0),
+                 ('tty0', 0, 5, 0o600, stat.S_IFCHR, 4, 0),
+                 ('urandom', 0, 0, 0o666, stat.S_IFCHR, 1, 9),
+                 ('zero', 0, 0, 0o666, stat.S_IFCHR, 1, 5)]
+
+        # loop0 - loop7
+        nodes += [('loop%d' % n, 0, 6, 0o660, stat.S_IFBLK, 7, n)
+                  for n in xrange(8)]
+
+        # ram0 - ram16
+        nodes += [('ram%d' % n, 0, 6, 0o660, stat.S_IFBLK, 1, n)
+                  for n in xrange(17)]
+
+        # Symlinks
+        links = [('core', '/proc/kcore'),
+                 ('fd', '/proc/self/fd'),
+                 ('ram', 'ram1'),
+                 ('stderr', 'fd/2'),
+                 ('stdin', 'fd/0'),
+                 ('stdout', 'fd/1')]
+
+        makedirs(os.path.join(self.path, 'dev'))
+        for node in nodes:
+            path = os.path.join(self.path, 'dev', node[0])
+            if not os.path.exists(path):
+                os.mknod(path, node[4], os.makedev(node[5], node[6]))
+                os.chmod(path, node[3])
+                os.chown(path, node[1], node[2])
+        for link in links:
+            path = os.path.join(self.path, 'dev', link[0])
+            if not os.path.exists(path):
+                os.symlink(link[1], path)
+        
+    def stage1(self):
+        # Create merged /usr directories
+        for dir in ['bin', 'lib', 'sbin']:
+            link = os.path.join(self.path, dir)
+            usrdir = os.path.join(self.path, 'usr', dir)
+            makedirs(usrdir)
+            if os.path.exists(link):
+                if not os.path.islink(link):
+                    raise Exception('%s exists but is not a symlink' % link)
+                os.unlink(link)
+            os.symlink(os.path.join('usr', dir), os.path.join(self.path, dir))
+
+        self.mark_priority_packages('essential')
+
+        self.cache.fetch_archives(self.progress)
+        for pkg in self.cache.get_changes():
+            # Manually extract the debs
+            archive = self.archive_path(pkg)
+            deb = apt_inst.DebFile(archive)
+            logging.info('Extracting %s' % pkg.name)
+            deb.data.go(self.extract_member)
+
+        self.fake_install(self.cache['dpkg'])
+
+    def stage2(self):
+        # apt_pkg.config.set('RootDir', self.path)
+        # apt_pkg.config.set('Dir', '/')
+        # apt_pkg.config.set('Dir::State::status', '/var/lib/dpkg/status')
+        #self.cache = apt.Cache()
+        #apt_pkg.init_system()
+
+        os.environ['LC_ALL'] = 'C'
+        os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
+
+        self.makedev()
+        self.mount('-t', 'proc', 'proc', os.path.join(self.path, 'proc'))
+        self.mount('-t', 'sysfs', 'sysfs', os.path.join(self.path, 'sys'))
+        #self.mount('--bind', '/dev', os.path.join(self.path, 'dev'))
+        self.mount('--bind', '/dev/pts', os.path.join(self.path, 'dev/pts'))
+
+        # Random prep
+        subprocess.check_call(['chroot', self.path, '/sbin/ldconfig'])
+        if not os.path.exists(os.path.join(self.path, 'usr/bin/awk')):
+            os.symlink('mawk', os.path.join(self.path, 'usr/bin/awk'))
+        if not os.path.exists(os.path.join(self.path, 'etc/localtime')):
+            os.symlink('/usr/share/zoneinfo/UTC',
+                       os.path.join(self.path, 'etc/localtime'))
+
+        print('Installing bootstrap packages')
+        early_packages = ['base-passwd', 'base-files', 'dpkg', 'libc6',
+                          'perl-base', 'mawk', 'debconf', 'debianutils',
+                          'passwd']
+        for pkgname in early_packages:
+            self.dpkg_install(self.cache[pkgname])
+
+        print('Unpacking essential packages')
+        for pkg in self.cache.get_changes():
+            #if pkg.name in early_packages:
+            #    continue
+            self.dpkg_unpack(pkg)
+
+        start_stop_daemon = os.path.join(self.path,
+                                         'sbin/start-stop-daemon')
+        if os.path.exists(start_stop_daemon):
+            os.rename(start_stop_daemon, start_stop_daemon + '.REAL')
+            os.symlink('/bin/true', start_stop_daemon)
+        policy_rc_d = os.path.join(self.path, 'usr/sbin/policy-rc.d')
+        with open(policy_rc_d, 'w') as f:
+            f.writelines(['#!/bin/sh\n',
+                          'exit 101\n'])
+        os.chmod(policy_rc_d, 0o755)
+
+        print('Configuring essential packages')
+        self.dpkg_configure_pending()
+
+        self.cache.open()
+        if self.required:
+            self.mark_priority_packages('required')
+        if self.important:
+            self.mark_priority_packages('important')
+        self.mark_requested_packages()
+
+        print('Installing remaining packages')
         self.cache.commit(fetch_progress=self.progress)
 
-        for f in [debconf_rc, debconf_config, debconf_templates]:
-            if os.path.exists(f):
-                os.unlink(f)
+        if os.path.exists(start_stop_daemon + '.REAL'):
+            os.unlink(start_stop_daemon)
+            os.rename(start_stop_daemon + '.REAL', start_stop_daemon)
+        os.unlink(policy_rc_d)
+
+        self.umount(os.path.join(self.path, 'dev/pts'))
+        #self.umount(os.path.join(self.path, 'dev'))
+        self.umount(os.path.join(self.path, 'sys'))
+        self.umount(os.path.join(self.path, 'proc'))
+
+    def bootstrap(self):
+        self.update()
+
+        if args.dry_run:
+            self.mark_all_packages()
+            packages = self.get_packages()
+            for pkg, ver in sorted(packages.items()):
+                print(pkg, ver, sep='\t')
+            return
+
+        self.stage1()
+        self.stage2()
+
+        print('Installation complete')
 
 if __name__ == '__main__':
     aparser = ArgumentParser(description='Bootstrap system with APT')
@@ -204,6 +452,16 @@ if __name__ == '__main__':
     aparser.add_argument('--packages', default='',
                          help='packages to include')
     aparser.add_argument('--keyring', help='keyring for verification')
+    aparser.add_argument('--required', action='store_true',
+                         default=True, help='enable required packages')
+    aparser.add_argument('--no-required', dest='required',
+                         action='store_false',
+                         help='disable required packages')
+    aparser.add_argument('--important', action='store_true',
+                         default=True, help='enable important packages')
+    aparser.add_argument('--no-important', dest='important',
+                         action='store_false',
+                         help='disable important packages')
     aparser.add_argument('--recommends', action='store_true',
                          default=True, help='enable package recommends')
     aparser.add_argument('--no-recommends', dest='recommends',
@@ -237,13 +495,9 @@ if __name__ == '__main__':
                              arch=args.arch,
                              packages=packages,
                              keyring=args.keyring,
+                             required=args.required,
+                             important=args.important,
                              recommends=args.recommends,
-                             debug=args.debug)
-    bootstrap.update()
-    bootstrap.mark_packages()
-    if args.dry_run:
-        packages = bootstrap.get_packages()
-        for pkg, ver in sorted(packages.items()):
-            print(pkg, ver, sep='\t')
-    else:
-        bootstrap.install_packages()    
+                             debug=args.debug,
+                             dry_run=args.dry_run)
+    bootstrap.bootstrap()
