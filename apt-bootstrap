@@ -24,11 +24,11 @@ DEFAULT_PLATFORM = 'i386'
 DEFAULT_COMPONENTS = ['endless', 'extra', 'core']
 DEFAULT_KEYRING = '/usr/share/keyrings/eos-archive-keyring.gpg'
 
-def makedirs(*args, **kwargs):
+def makedirs(name, mode=0o777, exist_ok=False):
     try:
-        os.makedirs(*args, **kwargs)
+        os.makedirs(name, mode)
     except OSError as err:
-        if err.errno != errno.EEXIST:
+        if not exist_ok or err.errno != errno.EEXIST:
             raise
 
 class PriorityFilter(apt.cache.Filter):
@@ -83,7 +83,7 @@ class AptBootstrap(object):
 
         # Create needed directories
         for dir in self.NEEDED_DIRS:
-            makedirs(os.path.join(self.path, dir))
+            makedirs(os.path.join(self.path, dir), exist_ok=True)
 
         # Create sources.list
         sources_list = os.path.join(self.path, 'etc/apt/sources.list')
@@ -132,7 +132,7 @@ class AptBootstrap(object):
             logging.warning('%s is already mounted' % target)
             return
         logging.info('Mounting %s' % target)
-        makedirs(target)
+        makedirs(target, exist_ok=True)
         subprocess.check_call(['mount'] + list(args))
         self.mounts.append(target)
 
@@ -210,12 +210,12 @@ class AptBootstrap(object):
                             %(member.name, len(data), member.size))
         logging.debug('Extracting %s' % member.name)
         dest = os.path.join(self.path, member.name)
-        makedirs(os.path.dirname(dest))
+        makedirs(os.path.dirname(dest), exist_ok=True)
         if member.isfile():
             with open(dest, 'wb') as f:
                 f.write(data)
         elif member.isdir():
-            makedirs(dest)
+            makedirs(dest, exist_ok=True)
         elif member.issym():
             os.symlink(member.linkname, dest)
         elif member.islnk():
@@ -320,7 +320,7 @@ class AptBootstrap(object):
                  ('stdin', 'fd/0'),
                  ('stdout', 'fd/1')]
 
-        makedirs(os.path.join(self.path, 'dev'))
+        makedirs(os.path.join(self.path, 'dev'), exist_ok=True)
         for node in nodes:
             path = os.path.join(self.path, 'dev', node[0])
             if not os.path.exists(path):
@@ -337,7 +337,7 @@ class AptBootstrap(object):
         for dir in ['bin', 'lib', 'sbin']:
             link = os.path.join(self.path, dir)
             usrdir = os.path.join(self.path, 'usr', dir)
-            makedirs(usrdir)
+            makedirs(usrdir, exist_ok=True)
             if os.path.exists(link):
                 if not os.path.islink(link):
                     raise Exception('%s exists but is not a symlink' % link)
