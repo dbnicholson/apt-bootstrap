@@ -122,9 +122,12 @@ class AptBootstrap(object):
             apt_pkg.config.set('Debug::pkgInitConfig', 'true')
             #apt_pkg.config.set('Debug::pkgDPkgPM', 'true')
 
-        self.cache = apt.Cache()
+        self.acquire_progress = \
+            apt.progress.text.AcquireProgress(outfile=sys.stderr)
+        self.op_progress = \
+            apt.progress.text.OpProgress(outfile=sys.stderr)
+        self.cache = apt.Cache(progress=self.op_progress)
         self.archive_dir = apt_pkg.config.find_dir('Dir::Cache::archives')
-        self.progress = apt.progress.text.AcquireProgress(outfile=sys.stderr)
 
     def mount(self, *args):
         target = args[-1]
@@ -158,8 +161,8 @@ class AptBootstrap(object):
         self.umount_all()
 
     def update(self):
-        self.cache.update(self.progress)
-        self.cache.open()
+        self.cache.update(self.acquire_progress)
+        self.cache.open(progress=self.op_progress)
 
     def mark_all_packages(self):
         self.mark_priority_packages('essential')
@@ -264,12 +267,12 @@ class AptBootstrap(object):
         with open(info, 'w+') as f:
             pass
 
-    def dpkg_install(self, pkg, force=False):
+    def dpkg_install(self, pkg):
         archive = self.archive_path(pkg)
         target_archive = os.path.join('/', os.path.relpath(archive,
                                                            self.path))
         cmd = ['chroot', self.path, 'dpkg', '--install',
-               '--force-depends', target_archive]
+               '--force-depends', '--force-unsafe-io', target_archive]
         logging.debug('Using dpkg to install %s' % pkg.name)
         subprocess.check_call(cmd)
 
@@ -278,13 +281,14 @@ class AptBootstrap(object):
         target_archive = os.path.join('/', os.path.relpath(archive,
                                                            self.path))
         cmd = ['chroot', self.path, 'dpkg', '--unpack',
-               '--force-depends', target_archive]
+               '--force-depends', '--force-unsafe-io', target_archive]
         logging.debug('Using dpkg to unpack %s' % pkg.name)
         subprocess.check_call(cmd)
 
     def dpkg_configure_pending(self):
         cmd = ['chroot', self.path, 'dpkg', '--configure',
-               '--force-depends', '--pending', '--force-configure-any']
+               '--force-depends', '--pending', '--force-configure-any',
+               '--force-unsafe-io']
         logging.debug('Using dpkg to configure packages')
         subprocess.check_call(cmd)
 
@@ -324,12 +328,14 @@ class AptBootstrap(object):
         for node in nodes:
             path = os.path.join(self.path, 'dev', node[0])
             if not os.path.exists(path):
+                logging.info('Creating device node %s' % path)
                 os.mknod(path, node[4], os.makedev(node[5], node[6]))
                 os.chmod(path, node[3])
                 os.chown(path, node[1], node[2])
         for link in links:
             path = os.path.join(self.path, 'dev', link[0])
             if not os.path.exists(path):
+                logging.info('Creating dev symlink %s' % path)
                 os.symlink(link[1], path)
         
     def stage1(self):
@@ -357,22 +363,15 @@ class AptBootstrap(object):
         self.fake_install(self.cache['dpkg'])
 
     def stage2(self):
-        # apt_pkg.config.set('RootDir', self.path)
-        # apt_pkg.config.set('Dir', '/')
-        # apt_pkg.config.set('Dir::State::status', '/var/lib/dpkg/status')
-        #self.cache = apt.Cache()
-        #apt_pkg.init_system()
-
         os.environ['LC_ALL'] = 'C'
         os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
 
         self.makedev()
         self.mount('-t', 'proc', 'proc', os.path.join(self.path, 'proc'))
         self.mount('-t', 'sysfs', 'sysfs', os.path.join(self.path, 'sys'))
-        #self.mount('--bind', '/dev', os.path.join(self.path, 'dev'))
         self.mount('--bind', '/dev/pts', os.path.join(self.path, 'dev/pts'))
 
-        # Random prep
+        # Random prep copied from debootstrap
         subprocess.check_call(['chroot', self.path, '/sbin/ldconfig'])
         if not os.path.exists(os.path.join(self.path, 'usr/bin/awk')):
             os.symlink('mawk', os.path.join(self.path, 'usr/bin/awk'))
@@ -389,10 +388,9 @@ class AptBootstrap(object):
 
         print('Unpacking essential packages')
         for pkg in self.cache.get_changes():
-            #if pkg.name in early_packages:
-            #    continue
             self.dpkg_unpack(pkg)
 
+        # Make sure we don't start any daemons in the chroot
         start_stop_daemon = os.path.join(self.path,
                                          'sbin/start-stop-daemon')
         if os.path.exists(start_stop_daemon):
@@ -407,7 +405,8 @@ class AptBootstrap(object):
         print('Configuring essential packages')
         self.dpkg_configure_pending()
 
-        self.cache.open()
+        # Re-open the cache to get updated dpkg status
+        self.cache.open(progress=self.op_progress)
         if self.required:
             self.mark_priority_packages('required')
         if self.important:
@@ -415,15 +414,15 @@ class AptBootstrap(object):
         self.mark_requested_packages()
 
         print('Installing remaining packages')
-        self.cache.commit(fetch_progress=self.progress)
+        self.cache.commit(fetch_progress=self.acquire_progress)
 
+        # Restore daemon control tools
         if os.path.exists(start_stop_daemon + '.REAL'):
             os.unlink(start_stop_daemon)
             os.rename(start_stop_daemon + '.REAL', start_stop_daemon)
         os.unlink(policy_rc_d)
 
         self.umount(os.path.join(self.path, 'dev/pts'))
-        #self.umount(os.path.join(self.path, 'dev'))
         self.umount(os.path.join(self.path, 'sys'))
         self.umount(os.path.join(self.path, 'proc'))
 
