@@ -352,7 +352,7 @@ class AptBootstrap(object):
 
         self.mark_priority_packages('essential')
 
-        self.cache.fetch_archives(self.progress)
+        self.cache.fetch_archives(self.acquire_progress)
         for pkg in self.cache.get_changes():
             # Manually extract the debs
             archive = self.archive_path(pkg)
