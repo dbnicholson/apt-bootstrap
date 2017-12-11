@@ -122,6 +122,11 @@ class AptBootstrap(object):
             apt_pkg.config.set('Debug::pkgInitConfig', 'true')
             #apt_pkg.config.set('Debug::pkgDPkgPM', 'true')
 
+        # Avoid saving these logs inside the chroot (debootstrap results
+        # don't include these either)
+        apt_pkg.config.set('Dir::Log::Terminal', '')
+        apt_pkg.config.set('Dir::Log::Planner', '')
+
         self.acquire_progress = \
             apt.progress.text.AcquireProgress(outfile=sys.stderr)
         self.op_progress = \
