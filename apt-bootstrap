@@ -341,7 +341,7 @@ class AptBootstrap(object):
 
     def stage1(self):
         # Create merged /usr directories
-        for dir in ['bin', 'lib', 'sbin']:
+        for dir in ['bin', 'lib', 'sbin', 'lib64']:
             link = os.path.join(self.path, dir)
             usrdir = os.path.join(self.path, 'usr', dir)
             makedirs(usrdir, exist_ok=True)
@@ -350,6 +350,17 @@ class AptBootstrap(object):
                     raise Exception('%s exists but is not a symlink' % link)
                 os.unlink(link)
             os.symlink(os.path.join('usr', dir), os.path.join(self.path, dir))
+
+            # Mirror /usr merge to /usr/lib/debug directory
+            usrdir = os.path.join(self.path, 'usr', 'lib', 'debug', 'usr', dir)
+            link = os.path.join(self.path, 'usr', 'lib', 'debug', dir)
+            makedirs(usrdir, exist_ok=True)
+            if os.path.exists(link):
+                if not os.path.islink(link):
+                    raise Exception('%s exists but is not a symlink' % link)
+                os.unlink(link)
+            os.symlink(os.path.join('usr', dir),
+                       os.path.join(self.path, 'usr', 'lib', 'debug', dir))
 
         self.mark_priority_packages('essential')
 
