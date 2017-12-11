@@ -21,7 +21,7 @@ DEFAULT_URL = 'http://obs-master.endlessm-sf.com:82/shared/eos'
 DEFAULT_SUITE = 'master'
 DEFAULT_ARCH = 'i386'
 DEFAULT_PLATFORM = 'i386'
-DEFAULT_COMPONENTS = ['endless', 'extra', 'core']
+DEFAULT_COMPONENTS = ['endless', 'core']
 DEFAULT_KEYRING = '/usr/share/keyrings/eos-archive-keyring.gpg'
 
 def makedirs(name, mode=0o777, exist_ok=False):
