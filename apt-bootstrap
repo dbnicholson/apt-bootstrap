@@ -21,7 +21,7 @@ DEFAULT_URL = 'http://obs-master.endlessm-sf.com:82/shared/eos'
 DEFAULT_SUITE = 'master'
 DEFAULT_ARCH = 'i386'
 DEFAULT_PLATFORM = 'i386'
-DEFAULT_COMPONENTS = ['endless', 'extra', 'core']
+DEFAULT_COMPONENTS = ['endless', 'core']
 DEFAULT_KEYRING = '/usr/share/keyrings/eos-archive-keyring.gpg'
 
 def makedirs(name, mode=0o777, exist_ok=False):
@@ -121,6 +121,11 @@ class AptBootstrap(object):
             apt_pkg.config.set('Debug::pkgProblemResolver', 'true')
             apt_pkg.config.set('Debug::pkgInitConfig', 'true')
             #apt_pkg.config.set('Debug::pkgDPkgPM', 'true')
+
+        # Avoid saving these logs inside the chroot (debootstrap results
+        # don't include these either)
+        apt_pkg.config.set('Dir::Log::Terminal', '')
+        apt_pkg.config.set('Dir::Log::Planner', '')
 
         self.acquire_progress = \
             apt.progress.text.AcquireProgress(outfile=sys.stderr)
@@ -295,36 +300,21 @@ class AptBootstrap(object):
     def makedev(self):
         """Create /dev files like debootstrap"""
         # Device files
-        nodes = [('console', 0, 5, 0o600, stat.S_IFCHR, 5, 1),
-                 ('full', 0, 0, 0o666, stat.S_IFCHR, 1, 7),
-                 ('kmem', 0, 15, 0o640, stat.S_IFCHR, 1, 2),
-                 ('mem', 0, 15, 0o640, stat.S_IFCHR, 1, 1),
+        nodes = [('full', 0, 0, 0o666, stat.S_IFCHR, 1, 7),
                  ('null', 0, 0, 0o666, stat.S_IFCHR, 1, 3),
-                 ('port', 0, 15, 0o640, stat.S_IFCHR, 1, 4),
-                 ('ptmx', 0, 5, 0o666, stat.S_IFCHR, 5, 2),
                  ('random', 0, 0, 0o666, stat.S_IFCHR, 1, 8),
                  ('tty', 0, 5, 0o666, stat.S_IFCHR, 5, 0),
-                 ('tty0', 0, 5, 0o600, stat.S_IFCHR, 4, 0),
                  ('urandom', 0, 0, 0o666, stat.S_IFCHR, 1, 9),
                  ('zero', 0, 0, 0o666, stat.S_IFCHR, 1, 5)]
 
-        # loop0 - loop7
-        nodes += [('loop%d' % n, 0, 6, 0o660, stat.S_IFBLK, 7, n)
-                  for n in xrange(8)]
-
-        # ram0 - ram16
-        nodes += [('ram%d' % n, 0, 6, 0o660, stat.S_IFBLK, 1, n)
-                  for n in xrange(17)]
-
         # Symlinks
-        links = [('core', '/proc/kcore'),
-                 ('fd', '/proc/self/fd'),
-                 ('ram', 'ram1'),
+        links = [('fd', '/proc/self/fd'),
                  ('stderr', 'fd/2'),
                  ('stdin', 'fd/0'),
                  ('stdout', 'fd/1')]
 
-        makedirs(os.path.join(self.path, 'dev'), exist_ok=True)
+        makedirs(os.path.join(self.path, 'dev', 'shm'), exist_ok=True)
+        makedirs(os.path.join(self.path, 'dev', 'pts'), exist_ok=True)
         for node in nodes:
             path = os.path.join(self.path, 'dev', node[0])
             if not os.path.exists(path):
@@ -337,10 +327,21 @@ class AptBootstrap(object):
             if not os.path.exists(path):
                 logging.info('Creating dev symlink %s' % path)
                 os.symlink(link[1], path)
-        
+
+        # Inside a container, we might not be allowed to create /dev/ptmx.
+        # If not, do the next best thing.
+        path = os.path.join(self.path, 'dev', 'ptmx')
+        try:
+            os.mknod(path, stat.S_IFCHR, os.makedev(5, 2))
+        except OSError:
+            logging.warning("Could not create /dev/ptmx, falling back to " \
+                            "symlink. This chroot will require /dev/pts " \
+                            "mounted with ptmxmode=666")
+            os.symlink('pts/ptmx', path)
+
     def stage1(self):
         # Create merged /usr directories
-        for dir in ['bin', 'lib', 'sbin']:
+        for dir in ['bin', 'lib', 'sbin', 'lib64']:
             link = os.path.join(self.path, dir)
             usrdir = os.path.join(self.path, 'usr', dir)
             makedirs(usrdir, exist_ok=True)
@@ -350,9 +351,20 @@ class AptBootstrap(object):
                 os.unlink(link)
             os.symlink(os.path.join('usr', dir), os.path.join(self.path, dir))
 
+            # Mirror /usr merge to /usr/lib/debug directory
+            usrdir = os.path.join(self.path, 'usr', 'lib', 'debug', 'usr', dir)
+            link = os.path.join(self.path, 'usr', 'lib', 'debug', dir)
+            makedirs(usrdir, exist_ok=True)
+            if os.path.exists(link):
+                if not os.path.islink(link):
+                    raise Exception('%s exists but is not a symlink' % link)
+                os.unlink(link)
+            os.symlink(os.path.join('usr', dir),
+                       os.path.join(self.path, 'usr', 'lib', 'debug', dir))
+
         self.mark_priority_packages('essential')
 
-        self.cache.fetch_archives(self.progress)
+        self.cache.fetch_archives(self.acquire_progress)
         for pkg in self.cache.get_changes():
             # Manually extract the debs
             archive = self.archive_path(pkg)
@@ -370,6 +382,7 @@ class AptBootstrap(object):
         self.mount('-t', 'proc', 'proc', os.path.join(self.path, 'proc'))
         self.mount('-t', 'sysfs', 'sysfs', os.path.join(self.path, 'sys'))
         self.mount('--bind', '/dev/pts', os.path.join(self.path, 'dev/pts'))
+        self.mount('--bind', '/tmp', os.path.join(self.path, 'tmp'))
 
         # Random prep copied from debootstrap
         subprocess.check_call(['chroot', self.path, '/sbin/ldconfig'])
@@ -425,6 +438,7 @@ class AptBootstrap(object):
         self.umount(os.path.join(self.path, 'dev/pts'))
         self.umount(os.path.join(self.path, 'sys'))
         self.umount(os.path.join(self.path, 'proc'))
+        self.umount(os.path.join(self.path, 'tmp'))
 
     def bootstrap(self):
         self.update()
