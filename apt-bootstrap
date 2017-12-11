@@ -375,6 +375,7 @@ class AptBootstrap(object):
         self.mount('-t', 'proc', 'proc', os.path.join(self.path, 'proc'))
         self.mount('-t', 'sysfs', 'sysfs', os.path.join(self.path, 'sys'))
         self.mount('--bind', '/dev/pts', os.path.join(self.path, 'dev/pts'))
+        self.mount('--bind', '/tmp', os.path.join(self.path, 'tmp'))
 
         # Random prep copied from debootstrap
         subprocess.check_call(['chroot', self.path, '/sbin/ldconfig'])
@@ -430,6 +431,7 @@ class AptBootstrap(object):
         self.umount(os.path.join(self.path, 'dev/pts'))
         self.umount(os.path.join(self.path, 'sys'))
         self.umount(os.path.join(self.path, 'proc'))
+        self.umount(os.path.join(self.path, 'tmp'))
 
     def bootstrap(self):
         self.update()
