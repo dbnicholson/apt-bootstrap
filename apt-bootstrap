@@ -21,7 +21,7 @@ DEFAULT_URL = 'http://obs-master.endlessm-sf.com:82/shared/eos'
 DEFAULT_SUITE = 'master'
 DEFAULT_ARCH = 'i386'
 DEFAULT_PLATFORM = 'i386'
-DEFAULT_COMPONENTS = ['endless', 'core']
+DEFAULT_COMPONENTS = 'endless,core'
 DEFAULT_KEYRING = '/usr/share/keyrings/eos-archive-keyring.gpg'
 
 def makedirs(name, mode=0o777, exist_ok=False):
@@ -58,7 +58,7 @@ class AptBootstrap(object):
         self.path = os.path.abspath(path)
         self.suite = suite
         self.url = url
-        self.components = components
+        self.components = components.split(',')
         self.arch = arch
         self.packages = packages
         self.keyring = keyring
