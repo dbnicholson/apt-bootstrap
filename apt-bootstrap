@@ -381,7 +381,6 @@ class AptBootstrap(object):
         self.makedev()
         self.mount('-t', 'proc', 'proc', os.path.join(self.path, 'proc'))
         self.mount('-t', 'sysfs', 'sysfs', os.path.join(self.path, 'sys'))
-        self.mount('--bind', '/dev/pts', os.path.join(self.path, 'dev/pts'))
         self.mount('--bind', '/tmp', os.path.join(self.path, 'tmp'))
 
         # Random prep copied from debootstrap
@@ -435,7 +434,6 @@ class AptBootstrap(object):
             os.rename(start_stop_daemon + '.REAL', start_stop_daemon)
         os.unlink(policy_rc_d)
 
-        self.umount(os.path.join(self.path, 'dev/pts'))
         self.umount(os.path.join(self.path, 'sys'))
         self.umount(os.path.join(self.path, 'proc'))
         self.umount(os.path.join(self.path, 'tmp'))
