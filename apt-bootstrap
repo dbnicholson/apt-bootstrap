@@ -99,6 +99,13 @@ class AptBootstrap(object):
             with open(self.dpkg_status, 'w') as f:
                 pass
 
+        # Satisfy runtime by creating dpkg available file. Apparently
+        # dpkg doesn't do this by itself, but debootstrap does.
+        dpkg_available = os.path.join(self.path,
+                                      'var/lib/dpkg/available')
+        with open(dpkg_available, 'a'):
+            pass
+
         # Setup configuration
         apt_pkg.config.set('APT::Architecture', self.arch)
         apt_pkg.config.set('Dir', self.path)
