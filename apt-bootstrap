@@ -114,15 +114,20 @@ class AptBootstrap(object):
         apt_pkg.config.set('APT::Install-Recommends',
                            str(self.recommends))
         apt_pkg.config.set('Dpkg::Options::', '--force-unsafe-io')
+
+        # Keyring configuration
+        self.target_keyring = os.path.join(
+            self.path, 'etc/apt/trusted.gpg.d/apt-bootstrap.gpg')
         if self.keyring is not None:
-            #apt_pkg.config.set('Dir::Etc::trusted', self.keyring)
-            keyring_path = os.path.join(self.path, 'etc/apt/trusted.gpg.d',
-                                        os.path.basename(self.keyring))
-            if not os.path.exists(keyring_path):
-                shutil.copy(self.keyring, keyring_path)
+            if not os.path.exists(self.target_keyring):
+                print('Installing temporary keyring',
+                      self.target_keyring)
+                shutil.copy(self.keyring, self.target_keyring)
         else:
             # If no keyring is provided, package verification will fail
             apt_pkg.config.set('APT::Get::AllowUnauthenticated', 'true')
+
+        # Debug configuration
         if self.debug:
             apt_pkg.config.set('Debug::pkgDepCache::AutoInstall', 'true')
             apt_pkg.config.set('Debug::pkgProblemResolver', 'true')
@@ -457,6 +462,11 @@ class AptBootstrap(object):
 
         self.stage1()
         self.stage2()
+
+        # Remove temporary keyring
+        if os.path.exists(self.target_keyring):
+            print('Removing temporary keyring', self.target_keyring)
+            os.unlink(self.target_kerying)
 
         print('Installation complete')
 
